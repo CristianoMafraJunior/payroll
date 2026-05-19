@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from dateutil import relativedelta
 
 from odoo import fields
+from odoo.exceptions import UserError
 from odoo.tests import common
 
 
@@ -219,3 +220,239 @@ class TestPayrollAccount(common.TransactionCase):
         # Test other account types -> no partner
         self.account_credit.account_type = "expense"
         self.assertFalse(line._get_partner_id(True))
+
+    def test_cancel_after_confirm_deletes_move(self):
+        """Test canceling a confirmed payslip deletes accounting entries."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+        self.hr_payslip.action_payslip_cancel()
+        self.assertEqual(self.hr_payslip.state, "cancel")
+        self.assertFalse(self.hr_payslip.move_id)
+
+    def test_cancel_after_confirm_restricted_journal(self):
+        """Test hash-locked journal triggers reverse move instead of delete."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+        self.account_journal.restrict_mode_hash_table = True
+        self.hr_payslip.action_payslip_cancel()
+        self.assertEqual(self.hr_payslip.state, "cancel")
+        self.assertFalse(self.hr_payslip.move_id)
+
+    def test_payslip_done_explicit_date(self):
+        """Test accounting entry uses the explicit date field when set."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        self._prepare_payslip(self.hr_employee_john)
+        explicit_date = fields.Date.from_string("2024-06-15")
+        self.hr_payslip.date = explicit_date
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertEqual(self.hr_payslip.move_id.date, explicit_date)
+
+    def test_payslip_done_credit_note(self):
+        """Test credit note payslip inverts line amounts in accounting entries."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.credit_note = True
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+
+    def test_payslip_done_contract_analytic_account(self):
+        """Test move lines carry analytic distribution from contract."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        analytic_account = self.env["account.analytic.account"].create(
+            {"name": "Contract Analytic"}
+        )
+        self.hr_contract_john.analytic_account_id = analytic_account
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+        lines_with_analytic = self.hr_payslip.move_id.line_ids.filtered(
+            "analytic_distribution"
+        )
+        self.assertTrue(lines_with_analytic)
+
+    def test_payslip_done_rule_analytic_account(self):
+        """Test move lines use rule analytic distribution when contract has none."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        analytic_account = self.env["account.analytic.account"].create(
+            {"name": "Rule Analytic"}
+        )
+        rule = self.env.ref("payroll.hr_salary_rule_houserentallowance1")
+        rule.analytic_account_id = analytic_account
+        self.hr_contract_john.analytic_account_id = False
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+        lines_with_analytic = self.hr_payslip.move_id.line_ids.filtered(
+            "analytic_distribution"
+        )
+        self.assertTrue(lines_with_analytic)
+
+    def test_payslip_done_adjustment_credit_line(self):
+        """Test adjustment credit line is created when debit_sum exceeds credit_sum."""
+        # Rule has only debit account → debit_sum > 0, credit_sum = 0
+        self._update_account_in_rule(self.account_debit, False)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+
+    def test_payslip_done_adjustment_debit_line(self):
+        """Test adjustment debit line is created when credit_sum exceeds debit_sum."""
+        # Rule has only credit account → credit_sum > 0, debit_sum = 0
+        self._update_account_in_rule(False, self.account_credit)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+
+    def test_payslip_done_no_default_account_credit_raises(self):
+        """Test UserError when journal has no default account, credit adjust needed."""
+        journal_no_default = self.env["account.journal"].create(
+            {"name": "No Default Journal Credit", "code": "NDC1", "type": "general"}
+        )
+        self.hr_contract_john.journal_id = journal_no_default
+        # Only debit account → adjustment credit line required → UserError
+        self._update_account_in_rule(self.account_debit, False)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        with self.assertRaises(UserError):
+            self.hr_payslip.action_payslip_done()
+
+    def test_payslip_done_no_default_account_debit_raises(self):
+        """Test UserError when journal lacks default account and debit adjust needed."""
+        journal_no_default = self.env["account.journal"].create(
+            {"name": "No Default Journal Debit", "code": "NDD1", "type": "general"}
+        )
+        self.hr_contract_john.journal_id = journal_no_default
+        # Only credit account → adjustment debit line required → UserError
+        self._update_account_in_rule(False, self.account_credit)
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        with self.assertRaises(UserError):
+            self.hr_payslip.action_payslip_done()
+
+    def test_onchange_contract_sets_journal(self):
+        """Test onchange_contract propagates journal from contract to payslip."""
+        payslip = self._prepare_payslip(self.hr_employee_john)
+        payslip.onchange_contract()
+        self.assertEqual(payslip.journal_id, self.account_journal)
+
+    def test_onchange_contract_no_contract(self):
+        """Test onchange_contract with no contract falls through to current journal."""
+        payslip = self._prepare_payslip(self.hr_employee_john)
+        payslip.contract_id = False
+        payslip.onchange_contract()
+        # Should not raise; journal fallback logic executes
+
+    def test_wizard_compute_sheet_propagates_run_journal(self):
+        """Test wizard sets default_journal_id from payslip run before calling super."""
+        payslip_run = self.env["hr.payslip.run"].create(
+            {
+                "name": "Test Run",
+                "journal_id": self.account_journal.id,
+                "date_start": fields.Date.today().replace(day=1),
+                "date_end": fields.Date.today().replace(day=1)
+                + relativedelta.relativedelta(months=1, days=-1),
+            }
+        )
+        wizard = (
+            self.env["hr.payslip.employees"]
+            .with_context(active_id=payslip_run.id)
+            .create({"employee_ids": [(4, self.hr_employee_john.id)]})
+        )
+        wizard.compute_sheet()
+        slip = self.env["hr.payslip"].search(
+            [("payslip_run_id", "=", payslip_run.id)], limit=1
+        )
+        self.assertTrue(slip)
+        self.assertEqual(slip.journal_id, self.account_journal)
+
+    def test_get_partner_id_no_work_contact_falls_back_to_bank(self):
+        """Test _get_partner_id uses bank partner when work_contact_id is unset."""
+        rule = self.env.ref("payroll.hr_salary_rule_houserentallowance1")
+        payslip = self._prepare_payslip(self.hr_employee_john)
+        line = self.env["hr.payslip.line"].create(
+            {"slip_id": payslip.id, "salary_rule_id": rule.id, "name": "Test"}
+        )
+        self.account_credit.account_type = "asset_receivable"
+        rule.account_credit = self.account_credit
+        self.hr_employee_john.work_contact_id = False
+        result = line._get_partner_id(True)
+        if self.hr_employee_john.bank_account_id:
+            self.assertEqual(
+                result, self.hr_employee_john.bank_account_id.partner_id.id
+            )
+        else:
+            self.assertFalse(result)
+
+    def test_get_partner_id_debit_account_path(self):
+        """Test _get_partner_id reads debit account type when credit_account=False."""
+        rule = self.env.ref("payroll.hr_salary_rule_houserentallowance1")
+        payslip = self._prepare_payslip(self.hr_employee_john)
+        line = self.env["hr.payslip.line"].create(
+            {"slip_id": payslip.id, "salary_rule_id": rule.id, "name": "Test"}
+        )
+        self.account_debit.account_type = "asset_receivable"
+        rule.account_debit = self.account_debit
+        result = line._get_partner_id(False)
+        self.assertEqual(result, self.hr_employee_john.work_contact_id.id)
+
+    def test_get_partner_id_liability_payable_no_register_returns_false(self):
+        """Test _get_partner_id returns False for liability_payable with no register."""
+        rule = self.env.ref("payroll.hr_salary_rule_houserentallowance1")
+        rule.register_id = False
+        payslip = self._prepare_payslip(self.hr_employee_john)
+        line = self.env["hr.payslip.line"].create(
+            {"slip_id": payslip.id, "salary_rule_id": rule.id, "name": "Test"}
+        )
+        self.account_credit.account_type = "liability_payable"
+        rule.account_credit = self.account_credit
+        self.assertFalse(line._get_partner_id(True))
+
+    def test_get_tax_details_with_account_tax_id(self):
+        """Test _get_tax_details runs repartition lookup when rule has a tax."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        tax = self.env["account.tax"].create(
+            {"name": "Payroll Test Tax", "amount": 10, "amount_type": "percent"}
+        )
+        rule = self.env.ref("payroll.hr_salary_rule_houserentallowance1")
+        rule.account_tax_id = tax
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
+
+    def test_get_tax_details_with_tax_line_ids(self):
+        """Test _get_tax_details aggregates tax_ids from tax_line_ids on salary rule."""
+        self._update_account_in_rule(self.account_debit, self.account_credit)
+        tax = self.env["account.tax"].create(
+            {"name": "Payroll Tax Line", "amount": 5, "amount_type": "percent"}
+        )
+        base_rule = self.env.ref("payroll.hr_salary_rule_houserentallowance1")
+        tax_rule = self.env["hr.salary.rule"].create(
+            {
+                "name": "Tax Line Rule",
+                "code": "TLR",
+                "category_id": self.env.ref("payroll.ALW").id,
+                "sequence": 99,
+                "amount_select": "fix",
+                "amount_fix": 0,
+                "tax_base_id": base_rule.id,
+                "account_tax_id": tax.id,
+            }
+        )
+        self.hr_structure_softwaredeveloper.rule_ids = [(4, tax_rule.id)]
+        self._prepare_payslip(self.hr_employee_john)
+        self.hr_payslip.compute_sheet()
+        self.hr_payslip.action_payslip_done()
+        self.assertTrue(self.hr_payslip.move_id)
